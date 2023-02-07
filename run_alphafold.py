@@ -116,19 +116,26 @@ flags.DEFINE_integer('random_seed', None, 'The random seed for the data '
                      'that even if this is set, Alphafold may still not be '
                      'deterministic, because processes like GPU inference are '
                      'nondeterministic.')
-flags.DEFINE_integer('num_multimer_predictions_per_model', 5, 'How many '
+flags.DEFINE_integer('num_predictions_per_model', 5, 'How many '
                      'predictions (each with a different random seed) will be '
                      'generated per model. E.g. if this is 2 and there are 5 '
                      'models then there will be 10 predictions per input. '
-                     'Note: this FLAG only applies if model_preset=multimer')
-flags.DEFINE_boolean('use_precomputed_msas', False, 'Whether to read MSAs that '
+                     'Note: this FLAG only applies if model_preset=multimer or dropout=True')
+flags.DEFINE_integer('nstruct_start',1, 'model to start with, can be used to parallelize jobs, '
+                     'e.g --num_predictions_per_model 20 --nstruct_start 20 will only make model _20'
+                     'e.g --num_predictions_per_model 21 --nstruct_start 20 will make model _20 and _21 etc.')
+flags.DEFINE_boolean('use_precomputed_msas', True, 'Whether to read MSAs that '
                      'have been written to disk instead of running the MSA '
                      'tools. The MSA files are looked up in the output '
                      'directory, so it must stay the same between multiple '
                      'runs that are to reuse the MSAs. WARNING: This will not '
                      'check if the sequence, database or configuration have '
                      'changed.')
-flags.DEFINE_enum_class('models_to_relax', ModelsToRelax.BEST, ModelsToRelax,
+flags.DEFINE_string('suffix','','suffix to all model output, added before model counter.')
+flags.DEFINE_string('input_msa',None,'Input msa to use instead of the default')
+flags.DEFINE_boolean('no_templates',False, 'will not use any template, will be faster than filter by date')
+flags.DEFINE_boolean('seq_only', False, 'exit after seq search')
+flags.DEFINE_enum_class('models_to_relax', ModelsToRelax.NONE, ModelsToRelax,
                         'The models to run the final relaxation step on. '
                         'If `all`, all models are relaxed, which may be time '
                         'consuming. If `best`, only the most confident model '
@@ -137,10 +144,18 @@ flags.DEFINE_enum_class('models_to_relax', ModelsToRelax.BEST, ModelsToRelax,
                         'distracting stereochemical violations but might help '
                         'in case you are having issues with the relaxation '
                         'stage.')
-flags.DEFINE_boolean('use_gpu_relax', None, 'Whether to relax on GPU. '
+flags.DEFINE_integer('max_recycles', 3, 'Max recycles')
+flags.DEFINE_boolean('use_gpu_relax', False, 'Whether to relax on GPU. '
                      'Relax on GPU can be much faster than CPU, so it is '
                      'recommended to enable if possible. GPUs must be available'
                      ' if this setting is enabled.')
+flags.DEFINE_boolean('dropout', False, 'Make is_training=True to turn on drop out during inference to get more '
+                                       'diversity')
+flags.DEFINE_boolean('dropout_structure_module', True, 'No dropout in structure module at inference')
+flags.DEFINE_boolean('output_all_results', False, 'Output original results pickle (LARGE..'
+                                                  'only recommended if you really know you need any of the following:'
+                                                  'distogram, experimentally_resolved, masked_msa,aligned_confidence_probs')
+flags.DEFINE_list('models_to_use', None, 'specify which models in model_preset that should be run')
 
 FLAGS = flags.FLAGS
 
@@ -197,7 +212,9 @@ def predict_structure(
       input_fasta_path=fasta_path,
       msa_output_dir=msa_output_dir)
   timings['features'] = time.time() - t_0
-
+  if FLAGS.seq_only:
+    logging.info('Exiting since --seq_only is True... ')
+    sys.exit()
   # Write out features as a pickled dictionary.
   features_output_path = os.path.join(output_dir, 'features.pkl')
   with open(features_output_path, 'wb') as f:
@@ -213,6 +230,10 @@ def predict_structure(
   num_models = len(model_runners)
   for model_index, (model_name, model_runner) in enumerate(
       model_runners.items()):
+    unrelaxed_pdb_path = os.path.join(output_dir, f'unrelaxed_{model_name}.pdb')
+    if os.path.exists(unrelaxed_pdb_path):
+      logging.info(f'{unrelaxed_pdb_path} already exists')
+      continue
     logging.info('Running model %s on %s', model_name, fasta_name)
     t_0 = time.time()
     model_random_seed = model_index + random_seed * num_models
@@ -247,8 +268,25 @@ def predict_structure(
 
     # Save the model outputs.
     result_output_path = os.path.join(output_dir, f'result_{model_name}.pkl')
-    with open(result_output_path, 'wb') as f:
-      pickle.dump(np_prediction_result, f, protocol=4)
+    if FLAGS.output_all_results:
+      with open(result_output_path, 'wb') as f:
+        pickle.dump(np_prediction_result, f, protocol=4)
+    else:
+      keys_to_remove = ['distogram', 'experimentally_resolved', 'masked_msa', 'aligned_confidence_probs']
+      d = {}
+      for k in np_prediction_result.keys():
+        if k not in keys_to_remove:
+          d[k] = np_prediction_result[k]
+      with open(result_output_path, 'wb') as f:
+        pickle.dump(d, f, protocol=4)
+
+    # Save the scores in json
+    d = {}
+    for k in ['plddt', 'ptm', 'iptm', 'ranking_confidence']:
+      if k in np_prediction_result:
+          d[k] = float(prediction_result[k])
+    with open(result_output_path + '.json', 'w') as f:
+      json.dump(d, f)
 
     # Add the predicted LDDT in the b-factor column.
     # Note that higher predicted LDDT value means higher model confidence.
@@ -262,7 +300,6 @@ def predict_structure(
 
     unrelaxed_proteins[model_name] = unrelaxed_protein
     unrelaxed_pdbs[model_name] = protein.to_pdb(unrelaxed_protein)
-    unrelaxed_pdb_path = os.path.join(output_dir, f'unrelaxed_{model_name}.pdb')
     with open(unrelaxed_pdb_path, 'w') as f:
       f.write(unrelaxed_pdbs[model_name])
 
@@ -299,13 +336,13 @@ def predict_structure(
 
   # Write out relaxed PDBs in rank order.
   for idx, model_name in enumerate(ranked_order):
-    ranked_output_path = os.path.join(output_dir, f'ranked_{idx}.pdb')
+    ranked_output_path = os.path.join(output_dir, f'ranked_{FLAGS.suffix}_{idx}.pdb')
     with open(ranked_output_path, 'w') as f:
       if model_name in relaxed_pdbs:
         f.write(relaxed_pdbs[model_name])
       else:
         f.write(unrelaxed_pdbs[model_name])
-
+  os.system(f'bzip2 -f {output_dir}/ranked*pdb')
   ranking_output_path = os.path.join(output_dir, 'ranking_debug.json')
   with open(ranking_output_path, 'w') as f:
     label = 'iptm+ptm' if 'iptm' in prediction_result else 'plddts'
@@ -393,44 +430,72 @@ def main(argv):
       small_bfd_database_path=FLAGS.small_bfd_database_path,
       template_searcher=template_searcher,
       template_featurizer=template_featurizer,
+      no_templates=FLAGS.no_templates,
       use_small_bfd=use_small_bfd,
+      input_msa=FLAGS.input_msa,
       use_precomputed_msas=FLAGS.use_precomputed_msas)
 
   if run_multimer_system:
-    num_predictions_per_model = FLAGS.num_multimer_predictions_per_model
+    num_predictions_per_model = FLAGS.num_predictions_per_model
     data_pipeline = pipeline_multimer.DataPipeline(
         monomer_data_pipeline=monomer_data_pipeline,
         jackhmmer_binary_path=FLAGS.jackhmmer_binary_path,
         uniprot_database_path=FLAGS.uniprot_database_path,
         use_precomputed_msas=FLAGS.use_precomputed_msas)
   else:
-    num_predictions_per_model = 1
+    if FLAGS.dropout:
+      num_predictions_per_model = FLAGS.num_predictions_per_model
+    else:
+      num_predictions_per_model = 1
     data_pipeline = monomer_data_pipeline
 
   model_runners = {}
   model_names = config.MODEL_PRESETS[FLAGS.model_preset]
+  if FLAGS.models_to_use:
+    model_names = [m for m in model_names if m in FLAGS.models_to_use]
+  if len(model_names) == 0:
+    raise ValueError(
+        f'No models to run: {FLAGS.models_to_use} is not in {config.MODEL_PRESETS[FLAGS.model_preset]}')
+
   for model_name in model_names:
     model_config = config.model_config(model_name)
     if run_multimer_system:
       model_config.model.num_ensemble_eval = num_ensemble
     else:
       model_config.data.eval.num_ensemble = num_ensemble
+
+    if FLAGS.dropout:
+      # dropout set is_training to True and during training models can be assembled. Here num_ensemble will
+      # always be 1 though. But unless this variable is set the program will crash.
+      model_config.model.num_ensemble_train = num_ensemble
+      if not FLAGS.dropout_structure_module:
+        model_config.model.heads.structure_module.dropout = 0.0
+
+    if FLAGS.max_recycles != 3:
+      logging.info(f'Setting max_recycles to {FLAGS.max_recycles}')
+      model_config.model.num_recycle = FLAGS.max_recycles
+      if not run_multimer_system:
+        model_config.data.common.num_recycle = FLAGS.max_recycles
+
     model_params = data.get_model_haiku_params(
         model_name=model_name, data_dir=FLAGS.data_dir)
-    model_runner = model.RunModel(model_config, model_params)
-    for i in range(num_predictions_per_model):
-      model_runners[f'{model_name}_pred_{i}'] = model_runner
+    model_runner = model.RunModel(model_config, model_params, is_training=FLAGS.dropout)
+    for i in range(FLAGS.nstruct_start, num_predictions_per_model + 1):
+      model_runners[f'{model_name}_{FLAGS.suffix}_{i}'] = model_runner
 
   logging.info('Have %d models: %s', len(model_runners),
                list(model_runners.keys()))
 
-  amber_relaxer = relax.AmberRelaxation(
-      max_iterations=RELAX_MAX_ITERATIONS,
-      tolerance=RELAX_ENERGY_TOLERANCE,
-      stiffness=RELAX_STIFFNESS,
-      exclude_residues=RELAX_EXCLUDE_RESIDUES,
-      max_outer_iterations=RELAX_MAX_OUTER_ITERATIONS,
-      use_gpu=FLAGS.use_gpu_relax)
+  if FLAGS.models_to_relax != ModelsToRelax.NONE:
+    amber_relaxer = relax.AmberRelaxation(
+        max_iterations=RELAX_MAX_ITERATIONS,
+        tolerance=RELAX_ENERGY_TOLERANCE,
+        stiffness=RELAX_STIFFNESS,
+        exclude_residues=RELAX_EXCLUDE_RESIDUES,
+        max_outer_iterations=RELAX_MAX_OUTER_ITERATIONS,
+        use_gpu=FLAGS.use_gpu_relax)
+  else:
+    amber_relaxer = None
 
   random_seed = FLAGS.random_seed
   if random_seed is None:

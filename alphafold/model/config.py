@@ -687,7 +687,7 @@ CONFIG_MULTIMER = ml_collections.ConfigDict({
             }
         },
         'num_ensemble_eval': 1,
-        'num_recycle': 20,
+        'num_recycle': 3,
         # A negative value indicates that no early stopping will occur, i.e.
         # the model will always run `num_recycle` number of recycling
         # iterations.  A positive value will enable early stopping if the
