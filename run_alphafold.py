@@ -255,7 +255,7 @@ def predict_structure(
     # Save the scores in json
     d = {}
     for k in ['plddt', 'ptm', 'iptm', 'ranking_confidence']:
-      if k in np_prediction_result:
+      if k in prediction_result:
           d[k] = float(prediction_result[k])
     with open(result_output_path + '.json', 'w') as f:
       json.dump(d, f)
