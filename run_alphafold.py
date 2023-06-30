@@ -291,8 +291,15 @@ def predict_structure(
   for model_index, (model_name, model_runner) in enumerate(
       model_runners.items()):
     unrelaxed_pdb_path = os.path.join(output_dir, f'unrelaxed_{model_name}.pdb')
+    result_output_path = os.path.join(output_dir, f'result_{model_name}.pkl')
     if os.path.exists(unrelaxed_pdb_path):
       logging.info(f'{unrelaxed_pdb_path} already exists')
+      with open(result_output_path, "rb") as f:
+        prediction_result = pickle.load(f)
+      ranking_confidences[model_name] = prediction_result['ranking_confidence']
+      with open(unrelaxed_pdb_path, 'r') as f:
+        unrelaxed_pdbs[model_name] = f.read()
+      unrelaxed_proteins[model_name] = protein.from_pdb_string(unrelaxed_pdbs[model_name])
       continue
     logging.info('Running model %s on %s', model_name, fasta_name)
     t_0 = time.time()
@@ -336,7 +343,6 @@ def predict_structure(
     np_prediction_result = _jnp_to_np(dict(prediction_result))
 
     # Save the model outputs.
-    result_output_path = os.path.join(output_dir, f'result_{model_name}.pkl')
     if FLAGS.output_all_results:
       with open(result_output_path, 'wb') as f:
         pickle.dump(np_prediction_result, f, protocol=4)
