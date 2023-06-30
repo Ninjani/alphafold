@@ -145,7 +145,7 @@ flags.DEFINE_enum_class('models_to_relax', ModelsToRelax.NONE, ModelsToRelax,
                         'distracting stereochemical violations but might help '
                         'in case you are having issues with the relaxation '
                         'stage.')
-flags.DEFINE_integer('max_recycles', 3, 'Max recycles')
+flags.DEFINE_integer('max_recycles', 20, 'Max recycles')
 flags.DEFINE_boolean('use_gpu_relax', False, 'Whether to relax on GPU. '
                      'Relax on GPU can be much faster than CPU, so it is '
                      'recommended to enable if possible. GPUs must be available'
